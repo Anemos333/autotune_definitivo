@@ -1,0 +1,43 @@
+name: Build VST3 macOS
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout del codice
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive # Necessario se usi i sottomoduli Git per JUCE/Antigravity
+
+    - name: Installare dipendenze di sistema
+      run: |
+        # macOS ha già Xcode e le build tools installate, ma puoi aggiungere altre dipendenze qui se servono
+
+    - name: Configurare CMake
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DJUCE_BUILD_EXTRAS=OFF
+
+    - name: Compilare il Plugin
+      run: |
+        cmake --build build --config Release --parallel 4
+
+    - name: Architettare il file VST3
+      run: |
+        # Comprime il VST3 generato in un file ZIP per poterlo scaricare facilmente
+        cd build/${{ github.event.repository.name }}_artefacts/Release/VST3
+        zip -r ../../../../MicrotonalAutotune_Mac_VST3.zip ./*
+
+    - name: Caricare l'Artefatto su GitHub
+      uses: actions/upload-artifact@v4
+      with:
+        name: MicrotonalAutotune-macOS-VST3
+        path: MicrotonalAutotune_Mac_VST3.zip
