@@ -69,8 +69,8 @@ jobs:
       - name: Carica artefatto
         uses: actions/upload-artifact@v4
         with:
-          name: MicrotonalAutotuneAggornamentoFixlatenza-macOS-VST3
-          path: MicrotonalAutotuneAggiornamentoLatenza_Mac_VST3.zip
+          name: MicrotonalAutotune-macOS-VST3
+          path: MicrotonalAutotune_Mac_VST3.zip
           
       - name: Upload AU Artifact
         uses: actions/upload-artifact@v4
