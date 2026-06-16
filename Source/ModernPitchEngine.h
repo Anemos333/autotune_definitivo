@@ -73,6 +73,10 @@ public:
         float harmonicity = 0.0f;
         float noisePath = 0.0f;
         float noiseReductionDb = 0.0f;
+        float polyphony = 0.0f;
+        float spectralReliability = 0.0f;
+        float maskStability = 1.0f;
+        float sustainedNoteSeconds = 0.0f;
         float consensus = 0.0f;
         float correctionCents = 0.0f;
         float wetMix = 0.0f;
@@ -158,6 +162,8 @@ private:
         float consensus = 0.0f;
         float onsetStrength = 0.0f;
         float breathReduction = 0.50f;
+        TrackingState trackingState = TrackingState::unvoiced;
+        float noteAgeSeconds = 0.0f;
     };
 
     class BiquadLowPass
@@ -391,7 +397,9 @@ private:
                                const Parameters& parameters) noexcept;
 
         void setSpectralReliability(float breathiness,
-                                    float harmonicity) noexcept;
+                                    float harmonicity,
+                                    float polyphony,
+                                    float spectralReliability) noexcept;
         void advanceOneSample(const Parameters& parameters) noexcept;
 
         [[nodiscard]] double getPitchRatio() const noexcept;
@@ -452,6 +460,8 @@ private:
         float currentOnsetStrength_ = 0.0f;
         float spectralBreathiness_ = 0.0f;
         float spectralHarmonicity_ = 1.0f;
+        float spectralPolyphony_ = 0.0f;
+        float spectralReliability_ = 1.0f;
         float authority_ = 0.0f;
         float authorityTarget_ = 0.0f;
         float wetMix_ = 0.0f;
@@ -564,6 +574,9 @@ private:
         [[nodiscard]] float getHarmonicity() const noexcept { return smoothedHarmonicity_; }
         [[nodiscard]] float getNoisePathAmount() const noexcept { return smoothedNoisePathAmount_; }
         [[nodiscard]] float getNoiseReductionDb() const noexcept { return currentNoiseReductionDb_; }
+        [[nodiscard]] float getPolyphony() const noexcept { return smoothedPolyphony_; }
+        [[nodiscard]] float getSpectralReliability() const noexcept { return smoothedSpectralReliability_; }
+        [[nodiscard]] float getMaskStability() const noexcept { return smoothedMaskStability_; }
 
     private:
         using Complex = std::complex<float>;
@@ -616,6 +629,39 @@ private:
         [[nodiscard]] float calculateHighBandFlatness(
             int firstBin,
             int lastBin) const noexcept;
+
+        struct AnalysisProfile
+        {
+            float combWeight = 0.46f;
+            float peakWeight = 0.25f;
+            float phaseWeight = 0.21f;
+            float periodicWeight = 0.08f;
+            float bodyFloorBase = 0.10f;
+            float bodyFloorTracking = 0.88f;
+            float bodyUpperHz = 4600.0f;
+            float maskAttackMs = 9.0f;
+            float maskReleaseMs = 38.0f;
+            float maskRisePerSecond = 34.0f;
+            float maskFallPerSecond = 13.0f;
+            float breathAttackMs = 24.0f;
+            float breathReleaseMs = 140.0f;
+            float metricAttackMs = 18.0f;
+            float metricReleaseMs = 95.0f;
+            float polyphonyAttackMs = 28.0f;
+            float polyphonyReleaseMs = 180.0f;
+            float reliabilityAttackMs = 22.0f;
+            float reliabilityReleaseMs = 120.0f;
+            float breathPersistenceStartMs = 25.0f;
+            float breathPersistenceFullMs = 130.0f;
+            float noiseDominanceStartMs = 35.0f;
+            float noiseDominanceFullMs = 180.0f;
+            float noiseDominanceThreshold = 0.80f;
+            float maximumNoiseReductionDb = 12.0f;
+            float unresolvedCombBlend = 0.35f;
+            float breathMaskBodyReduction = 0.10f;
+            float breathMaskAirReduction = 0.62f;
+            float polyphonyTrust = 1.0f;
+        };
 
         double sampleRate_ = 48000.0;
         int frameSize_ = 0;
@@ -679,6 +725,9 @@ private:
         float smoothedNoisePathAmount_ = 0.0f;
         float smoothedNoiseGain_ = 1.0f;
         float currentNoiseReductionDb_ = 0.0f;
+        float smoothedPolyphony_ = 0.0f;
+        float smoothedSpectralReliability_ = 1.0f;
+        float smoothedMaskStability_ = 1.0f;
         float breathProtection_ = 0.0f;
         float breathAttackCoefficient_ = 1.0f;
         float breathReleaseCoefficient_ = 1.0f;
@@ -689,9 +738,17 @@ private:
         float noiseReductionAttackCoefficient_ = 1.0f;
         float noiseReductionReleaseCoefficient_ = 1.0f;
         float transientNoiseRestoreCoefficient_ = 1.0f;
+        float polyphonyAttackCoefficient_ = 1.0f;
+        float polyphonyReleaseCoefficient_ = 1.0f;
+        float reliabilityAttackCoefficient_ = 1.0f;
+        float reliabilityReleaseCoefficient_ = 1.0f;
         float dryBreathLowPass_ = 0.0f;
         float dryBreathLowPassCoefficient_ = 1.0f;
-        int breathPersistenceFrames_ = 0;
+        float breathPersistenceMs_ = 0.0f;
+        float noiseDominanceMs_ = 0.0f;
+        float maskRiseLimitPerFrame_ = 1.0f;
+        float maskFallLimitPerFrame_ = 1.0f;
+        AnalysisProfile profile_ {};
 
     };
 
@@ -725,6 +782,8 @@ private:
     CorrectionController correctionController_;
     TransitionManager transitionManager_;
     CreativeTempo::Controller tempoController_;
+    float noteAgeTargetHz_ = 0.0f;
+    std::int64_t noteAgeSamples_ = 0;
 
     std::array<SpectralVoiceShifter, maxSupportedChannels> shifters_;
     std::array<FixedDelay, maxSupportedChannels> auxiliaryDelays_;
@@ -740,6 +799,10 @@ private:
     std::atomic<float> meterHarmonicity_ { 0.0f };
     std::atomic<float> meterNoisePath_ { 0.0f };
     std::atomic<float> meterNoiseReductionDb_ { 0.0f };
+    std::atomic<float> meterPolyphony_ { 0.0f };
+    std::atomic<float> meterSpectralReliability_ { 0.0f };
+    std::atomic<float> meterMaskStability_ { 1.0f };
+    std::atomic<float> meterSustainedNoteSeconds_ { 0.0f };
     std::atomic<float> meterConsensus_ { 0.0f };
     std::atomic<float> meterCorrectionCents_ { 0.0f };
     std::atomic<float> meterWetMix_ { 0.0f };

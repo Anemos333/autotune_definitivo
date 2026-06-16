@@ -1406,6 +1406,8 @@ void ModernPitchEngine::CorrectionController::reset() noexcept
     currentOnsetStrength_ = 0.0f;
     spectralBreathiness_ = 0.0f;
     spectralHarmonicity_ = 1.0f;
+    spectralPolyphony_ = 0.0f;
+    spectralReliability_ = 1.0f;
     authority_ = 0.0f;
     authorityTarget_ = 0.0f;
     wetMix_ = 0.0f;
@@ -1418,10 +1420,14 @@ void ModernPitchEngine::CorrectionController::reset() noexcept
 
 void ModernPitchEngine::CorrectionController::setSpectralReliability(
     float breathiness,
-    float harmonicity) noexcept
+    float harmonicity,
+    float polyphony,
+    float spectralReliability) noexcept
 {
     spectralBreathiness_ = clamp01(breathiness);
     spectralHarmonicity_ = clamp01(harmonicity);
+    spectralPolyphony_ = clamp01(polyphony);
+    spectralReliability_ = clamp01(spectralReliability);
 }
 
 void ModernPitchEngine::CorrectionController::enterState(TrackingState newState,
@@ -1674,8 +1680,21 @@ void ModernPitchEngine::CorrectionController::acceptObservation(
 
     const float confidenceGate = confidenceAuthority(currentConfidence_,
                                                       parameters.detectorSensitivity);
+    // Reliability is a safety gate, not a permanent loss of correction
+    // strength.  Clean monophonic frames pass at unity; only clearly weak
+    // consensus, noise-dominant spectra or competing pitch families retreat
+    // toward the aligned dry path.
+    const float consensusGate = 0.30f + 0.70f
+        * smoothStep(0.08f, 0.48f, observation.consensus);
+    const float spectralGate = 0.25f + 0.75f
+        * smoothStep(0.22f, 0.68f, spectralReliability_);
+    const float polyphonyGate = 1.0f - 0.82f
+        * smoothStep(0.12f, 0.65f, spectralPolyphony_);
     authorityTarget_ = clamp01(confidenceGate
-                               * (voicedLatched_ ? smoothedVoicing_ : 0.0f));
+                               * (voicedLatched_ ? smoothedVoicing_ : 0.0f)
+                               * consensusGate
+                               * spectralGate
+                               * polyphonyGate);
 
     const float correctionNeed = smoothStep(
         1.5f, 10.0f, static_cast<float>(std::abs(desiredCorrectionCents_)));
@@ -1683,7 +1702,10 @@ void ModernPitchEngine::CorrectionController::acceptObservation(
         - clamp01(parameters.transientProtection) * currentOnsetStrength_;
     wetMixTarget_ = clamp01((voicedLatched_ ? smoothedVoicing_ : 0.0f)
                             * correctionNeed
-                            * transientAttenuation);
+                            * transientAttenuation
+                            * consensusGate
+                            * spectralGate
+                            * polyphonyGate);
 
     ++stableObservationCount_;
     if (state_ == TrackingState::unvoiced || state_ == TrackingState::release)
@@ -2214,12 +2236,107 @@ void ModernPitchEngine::SpectralVoiceShifter::prepare(double sampleRate,
         layer.phaseInitialised = false;
     }
 
-    const double wetAttackMs = frameSize_ <= 128 ? 10.0
-                             : frameSize_ <= 256 ? 8.0
+    // Wind Fix V6: each latency mode receives its own analysis profile.
+    // A 128-sample FFT cannot be tuned as if it had the resolution of a
+    // 512-sample FFT.  Short modes therefore trust the independent F0 tracker
+    // more, change the harmonic/noise mask more slowly and reduce correction
+    // authority when the spectrum becomes noise-dominant.
+    if (frameSize_ <= 128)
+    {
+        profile_.combWeight = 0.58f;
+        profile_.peakWeight = 0.15f;
+        profile_.phaseWeight = 0.12f;
+        profile_.periodicWeight = 0.15f;
+        profile_.bodyFloorBase = 0.30f;
+        profile_.bodyFloorTracking = 0.70f;
+        profile_.bodyUpperHz = 5200.0f;
+        profile_.maskAttackMs = 24.0f;
+        profile_.maskReleaseMs = 110.0f;
+        profile_.maskRisePerSecond = 22.0f;
+        profile_.maskFallPerSecond = 7.0f;
+        profile_.breathAttackMs = 35.0f;
+        profile_.breathReleaseMs = 220.0f;
+        profile_.metricAttackMs = 30.0f;
+        profile_.metricReleaseMs = 180.0f;
+        profile_.polyphonyAttackMs = 45.0f;
+        profile_.polyphonyReleaseMs = 260.0f;
+        profile_.reliabilityAttackMs = 35.0f;
+        profile_.reliabilityReleaseMs = 180.0f;
+        profile_.breathPersistenceStartMs = 40.0f;
+        profile_.breathPersistenceFullMs = 180.0f;
+        profile_.noiseDominanceStartMs = 60.0f;
+        profile_.noiseDominanceFullMs = 220.0f;
+        profile_.noiseDominanceThreshold = 0.80f;
+        profile_.maximumNoiseReductionDb = 10.0f;
+        profile_.unresolvedCombBlend = 0.78f;
+        profile_.breathMaskBodyReduction = 0.03f;
+        profile_.breathMaskAirReduction = 0.32f;
+        profile_.polyphonyTrust = 0.45f;
+    }
+    else if (frameSize_ <= 256)
+    {
+        profile_.combWeight = 0.54f;
+        profile_.peakWeight = 0.20f;
+        profile_.phaseWeight = 0.16f;
+        profile_.periodicWeight = 0.10f;
+        profile_.bodyFloorBase = 0.22f;
+        profile_.bodyFloorTracking = 0.78f;
+        profile_.bodyUpperHz = 4900.0f;
+        profile_.maskAttackMs = 16.0f;
+        profile_.maskReleaseMs = 75.0f;
+        profile_.maskRisePerSecond = 30.0f;
+        profile_.maskFallPerSecond = 9.0f;
+        profile_.breathAttackMs = 28.0f;
+        profile_.breathReleaseMs = 180.0f;
+        profile_.metricAttackMs = 22.0f;
+        profile_.metricReleaseMs = 130.0f;
+        profile_.polyphonyAttackMs = 35.0f;
+        profile_.polyphonyReleaseMs = 220.0f;
+        profile_.reliabilityAttackMs = 28.0f;
+        profile_.reliabilityReleaseMs = 150.0f;
+        profile_.breathPersistenceStartMs = 32.0f;
+        profile_.breathPersistenceFullMs = 150.0f;
+        profile_.noiseDominanceStartMs = 48.0f;
+        profile_.noiseDominanceFullMs = 200.0f;
+        profile_.noiseDominanceThreshold = 0.80f;
+        profile_.maximumNoiseReductionDb = 11.0f;
+        profile_.unresolvedCombBlend = 0.58f;
+        profile_.breathMaskBodyReduction = 0.06f;
+        profile_.breathMaskAirReduction = 0.48f;
+        profile_.polyphonyTrust = 0.75f;
+    }
+    else
+    {
+        profile_ = AnalysisProfile {};
+        profile_.maskAttackMs = 8.0f;
+        profile_.maskReleaseMs = 42.0f;
+        profile_.maskRisePerSecond = 50.0f;
+        profile_.maskFallPerSecond = 16.0f;
+        profile_.breathAttackMs = 18.0f;
+        profile_.breathReleaseMs = 120.0f;
+        profile_.metricAttackMs = 12.0f;
+        profile_.metricReleaseMs = 80.0f;
+        profile_.polyphonyAttackMs = 25.0f;
+        profile_.polyphonyReleaseMs = 160.0f;
+        profile_.reliabilityAttackMs = 18.0f;
+        profile_.reliabilityReleaseMs = 100.0f;
+        profile_.breathPersistenceStartMs = 24.0f;
+        profile_.breathPersistenceFullMs = 125.0f;
+        profile_.noiseDominanceStartMs = 35.0f;
+        profile_.noiseDominanceFullMs = 180.0f;
+        profile_.maximumNoiseReductionDb = 12.0f;
+        profile_.unresolvedCombBlend = 0.30f;
+        profile_.breathMaskBodyReduction = 0.10f;
+        profile_.breathMaskAirReduction = 0.62f;
+        profile_.polyphonyTrust = 1.0f;
+    }
+
+    const double wetAttackMs = frameSize_ <= 128 ? 12.0
+                             : frameSize_ <= 256 ? 9.0
                                                  : 6.0;
-    const double wetReleaseMs = frameSize_ <= 128 ? 55.0
-                              : frameSize_ <= 256 ? 45.0
-                                                  : 35.0;
+    const double wetReleaseMs = frameSize_ <= 128 ? 80.0
+                              : frameSize_ <= 256 ? 60.0
+                                                  : 40.0;
 
     wetAttackCoefficient_ = static_cast<float>(
         1.0 - std::exp(-1.0 / (wetAttackMs * 0.001 * sampleRate_)));
@@ -2242,28 +2359,33 @@ void ModernPitchEngine::SpectralVoiceShifter::prepare(double sampleRate,
         std::exp(-1.0 / (0.012 * sampleRate_)));
 
     const double frameSeconds = static_cast<double>(hopSize_) / sampleRate_;
-    breathAttackCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.018));
-    breathReleaseCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.110));
-    maskAttackCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.006));
-    maskReleaseCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.024));
-    metricAttackCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.012));
-    metricReleaseCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.070));
+    const auto frameCoefficient = [frameSeconds](float milliseconds) noexcept
+    {
+        const double seconds = std::max(0.001,
+            static_cast<double>(milliseconds) * 0.001);
+        return static_cast<float>(1.0 - std::exp(-frameSeconds / seconds));
+    };
 
-    // Wind Fix V5: the residual attenuation is frame-rate controlled, so it
-    // adds no per-sample transcendental work.  Reduction enters smoothly,
-    // releases slowly to avoid pumping, but restores rapidly on transients.
-    noiseReductionAttackCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.028));
-    noiseReductionReleaseCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.180));
-    transientNoiseRestoreCoefficient_ = static_cast<float>(
-        1.0 - std::exp(-frameSeconds / 0.006));
+    breathAttackCoefficient_ = frameCoefficient(profile_.breathAttackMs);
+    breathReleaseCoefficient_ = frameCoefficient(profile_.breathReleaseMs);
+    maskAttackCoefficient_ = frameCoefficient(profile_.maskAttackMs);
+    maskReleaseCoefficient_ = frameCoefficient(profile_.maskReleaseMs);
+    metricAttackCoefficient_ = frameCoefficient(profile_.metricAttackMs);
+    metricReleaseCoefficient_ = frameCoefficient(profile_.metricReleaseMs);
+    polyphonyAttackCoefficient_ = frameCoefficient(profile_.polyphonyAttackMs);
+    polyphonyReleaseCoefficient_ = frameCoefficient(profile_.polyphonyReleaseMs);
+    reliabilityAttackCoefficient_ = frameCoefficient(profile_.reliabilityAttackMs);
+    reliabilityReleaseCoefficient_ = frameCoefficient(profile_.reliabilityReleaseMs);
+    maskRiseLimitPerFrame_ = static_cast<float>(frameSeconds)
+        * profile_.maskRisePerSecond;
+    maskFallLimitPerFrame_ = static_cast<float>(frameSeconds)
+        * profile_.maskFallPerSecond;
+
+    noiseReductionAttackCoefficient_ = frameCoefficient(
+        frameSize_ <= 128 ? 42.0f : frameSize_ <= 256 ? 34.0f : 28.0f);
+    noiseReductionReleaseCoefficient_ = frameCoefficient(
+        frameSize_ <= 128 ? 260.0f : frameSize_ <= 256 ? 220.0f : 180.0f);
+    transientNoiseRestoreCoefficient_ = frameCoefficient(6.0f);
     dryBreathLowPassCoefficient_ = static_cast<float>(
         1.0 - std::exp(-twoPi * 2800.0 / sampleRate_));
     reset();
@@ -2324,9 +2446,13 @@ void ModernPitchEngine::SpectralVoiceShifter::reset() noexcept
     smoothedNoisePathAmount_ = 0.0f;
     smoothedNoiseGain_ = 1.0f;
     currentNoiseReductionDb_ = 0.0f;
+    smoothedPolyphony_ = 0.0f;
+    smoothedSpectralReliability_ = 1.0f;
+    smoothedMaskStability_ = 1.0f;
     dryBreathLowPass_ = 0.0f;
     breathProtection_ = 0.0f;
-    breathPersistenceFrames_ = 0;
+    breathPersistenceMs_ = 0.0f;
+    noiseDominanceMs_ = 0.0f;
     envelopeFrameCounter_ = 0;
 }
 
@@ -2662,10 +2788,18 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
             * (0.0f - smoothedHarmonicity_);
         smoothedNoisePathAmount_ += metricReleaseCoefficient_
             * (1.0f - smoothedNoisePathAmount_);
+        smoothedPolyphony_ += polyphonyReleaseCoefficient_
+            * (0.0f - smoothedPolyphony_);
+        smoothedSpectralReliability_ += reliabilityReleaseCoefficient_
+            * (0.0f - smoothedSpectralReliability_);
+        smoothedMaskStability_ += metricAttackCoefficient_
+            * (1.0f - smoothedMaskStability_);
         breathProtection_ = smoothStep(0.24f, 0.74f, smoothedBreathiness_);
         return;
     }
 
+    const float frameDurationMs = 1000.0f * static_cast<float>(hopSize_)
+        / static_cast<float>(sampleRate_);
     const float binWidthHz = static_cast<float>(sampleRate_
         / static_cast<double>(frameSize_));
     const float f0 = context.detectedPitchHz;
@@ -2676,11 +2810,18 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
         0.42f * context.confidence
         + 0.32f * context.voicing
         + 0.26f * context.consensus);
+    const float resolutionRatio = reliableF0
+        ? f0 / std::max(1.0f, binWidthHz)
+        : 0.0f;
+    const float resolvedCombAmount = smoothStep(0.60f, 1.70f,
+                                                 resolutionRatio);
 
     double totalEnergy = 0.0;
     double highEnergy = 0.0;
     double airEnergy = 0.0;
     double baseHarmonicEnergy = 0.0;
+    double prominentPeakEnergy = 0.0;
+    double offFamilyPeakEnergy = 0.0;
 
     for (int bin = 0; bin <= positiveBins; ++bin)
     {
@@ -2730,72 +2871,118 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
         const float phaseCoherence = 1.0f
             - smoothStep(0.22f, 1.35f, phaseDeviation);
 
-        float combEvidence = 0.0f;
-        if (reliableF0 && frequencyHz >= 0.60f * f0)
+        float resolvedCombEvidence = 0.0f;
+        float binCoverageEvidence = 0.0f;
+        if (reliableF0 && frequencyHz >= 0.55f * f0)
         {
             const int harmonicNumber = std::max(
                 1,
                 static_cast<int>(std::lround(frequencyHz / f0)));
             const float expectedFrequency = static_cast<float>(harmonicNumber) * f0;
             const float distanceHz = std::abs(frequencyHz - expectedFrequency);
-            const float toleranceHz = std::min(
-                0.23f * f0,
-                std::max(0.78f * binWidthHz,
-                         0.030f * f0 + 0.0045f * frequencyHz));
-            combEvidence = 1.0f
-                - smoothStep(toleranceHz,
-                             std::max(toleranceHz + binWidthHz,
-                                      2.55f * toleranceHz),
+
+            const float resolvedToleranceHz = std::max(
+                0.34f * binWidthHz,
+                0.022f * f0 + 0.0035f * frequencyHz);
+            resolvedCombEvidence = 1.0f
+                - smoothStep(resolvedToleranceHz,
+                             std::max(resolvedToleranceHz + 0.25f * binWidthHz,
+                                      2.45f * resolvedToleranceHz),
+                             distanceHz);
+
+            // For 128/256-sample FFTs several harmonics may lie inside one
+            // analysis bin.  Test the whole bin footprint rather than only
+            // its centre; this is the F0-guided parametric mask used when the
+            // individual partials are unresolved.
+            const float coverageToleranceHz = 0.58f * binWidthHz
+                                            + 0.055f * f0;
+            binCoverageEvidence = 1.0f
+                - smoothStep(coverageToleranceHz,
+                             1.75f * coverageToleranceHz,
                              distanceHz);
         }
+
+        const float guidedBandWeight = 1.0f - smoothStep(
+            0.72f * profile_.bodyUpperHz,
+            1.45f * profile_.bodyUpperHz,
+            frequencyHz);
+        const float unresolvedEvidence = binCoverageEvidence
+            * periodicEvidence
+            * profile_.unresolvedCombBlend
+            * guidedBandWeight;
+        const float combEvidence = clamp01(
+            resolvedCombAmount * resolvedCombEvidence
+            + (1.0f - resolvedCombAmount) * unresolvedEvidence);
 
         const float lowBandPrior = 1.0f
             - smoothStep(2500.0f, 8500.0f, frequencyHz);
         float rawMask = reliableF0
-            ? (0.46f * combEvidence
-               + 0.25f * localPeakEvidence
-               + 0.21f * phaseCoherence
-               + 0.08f * periodicEvidence * lowBandPrior)
+            ? (profile_.combWeight * combEvidence
+               + profile_.peakWeight * localPeakEvidence
+               + profile_.phaseWeight * phaseCoherence
+               + profile_.periodicWeight * periodicEvidence * lowBandPrior)
             : (0.55f * localPeakEvidence
                + 0.35f * phaseCoherence
                + 0.10f * periodicEvidence * lowBandPrior);
 
-        // Coarse Live/Experimental FFTs cannot resolve individual low-order
-        // harmonics reliably.  In the body band, trust the independent F0
-        // tracker and apply a resolution-dependent voiced floor.  Breath is
-        // still separated progressively above the formant/body region.
-        if (frequencyHz >= 70.0f && frequencyHz <= 4600.0f)
+        if (frequencyHz >= 70.0f && frequencyHz <= profile_.bodyUpperHz)
         {
-            const float bodyWeight = 1.0f
-                - smoothStep(1900.0f, 4600.0f, frequencyHz);
-            const float resolutionBase = frameSize_ <= 128 ? 0.18f
-                                       : frameSize_ <= 256 ? 0.14f
-                                                           : 0.10f;
-            const float resolutionTracking = frameSize_ <= 128 ? 0.88f
-                                           : frameSize_ <= 256 ? 0.88f
-                                                               : 0.88f;
+            const float bodyWeight = 1.0f - smoothStep(
+                0.52f * profile_.bodyUpperHz,
+                profile_.bodyUpperHz,
+                frequencyHz);
             const float voicedFloor = bodyWeight
-                * (resolutionBase + resolutionTracking * periodicEvidence);
+                * (profile_.bodyFloorBase
+                   + profile_.bodyFloorTracking * periodicEvidence)
+                * (0.82f + 0.18f * context.consensus);
             rawMask = std::max(rawMask, voicedFloor);
         }
+
         if (bin == 0 || bin == positiveBins)
             rawMask = 0.0f;
 
         rawHarmonicMask_[index] = clamp01(rawMask);
         baseHarmonicEnergy += energy
             * static_cast<double>(rawHarmonicMask_[index]);
+
+        // Polyphony/bleed evidence is measured only on prominent body-band
+        // peaks.  It is intentionally conservative on unresolved FFTs and is
+        // later combined with cross-rate disagreement from the pitch tracker.
+        if (frequencyHz >= 75.0f && frequencyHz <= 6000.0f
+            && localPeakEvidence > 0.18f)
+        {
+            const double weightedPeakEnergy = energy
+                * static_cast<double>(localPeakEvidence);
+            const float familyEvidence = clamp01(
+                resolvedCombAmount * resolvedCombEvidence
+                + (1.0f - resolvedCombAmount)
+                    * (0.65f * binCoverageEvidence
+                       + 0.35f * periodicEvidence));
+            prominentPeakEnergy += weightedPeakEnergy;
+            offFamilyPeakEnergy += weightedPeakEnergy
+                * static_cast<double>(1.0f - familyEvidence);
+        }
     }
 
-    // Smooth the mask across frequency before temporal hysteresis.  A soft
-    // mask avoids musical-noise islands and keeps adjacent sidebands together.
+    // Frequency smoothing radius depends on resolution.  Wider smoothing in
+    // short modes avoids isolated mask islands, a common source of musical
+    // noise and the perceived "wind" modulation.
+    const int smoothingRadius = frameSize_ <= 128 ? 2 : 1;
     for (int bin = 0; bin <= positiveBins; ++bin)
     {
-        const int left = std::max(0, bin - 1);
-        const int right = std::min(positiveBins, bin + 1);
+        float weightedSum = 0.0f;
+        float weightTotal = 0.0f;
+        for (int offset = -smoothingRadius; offset <= smoothingRadius; ++offset)
+        {
+            const int sourceBin = std::clamp(bin + offset, 0, positiveBins);
+            const float weight = static_cast<float>(smoothingRadius + 1
+                                                     - std::abs(offset));
+            weightedSum += weight
+                * rawHarmonicMask_[static_cast<std::size_t>(sourceBin)];
+            weightTotal += weight;
+        }
         harmonicMaskScratch_[static_cast<std::size_t>(bin)] = clamp01(
-            0.22f * rawHarmonicMask_[static_cast<std::size_t>(left)]
-            + 0.56f * rawHarmonicMask_[static_cast<std::size_t>(bin)]
-            + 0.22f * rawHarmonicMask_[static_cast<std::size_t>(right)]);
+            weightedSum / std::max(1.0f, weightTotal));
     }
 
     const float highRatio = totalEnergy > 1.0e-14
@@ -2819,6 +3006,9 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
     const float flatScore = smoothStep(0.20f, 0.67f, highFlatness);
     const float noiseScore = smoothStep(0.28f, 0.78f, 1.0f - baseHarmonicity);
     const float weakPeriodicScore = 1.0f - periodicEvidence;
+    const float transientEvidence = clamp01(
+        0.68f * smoothStep(0.18f, 0.62f, spectralFlux)
+        + 0.32f * clamp01(context.onsetStrength));
     const float transientPenalty = 0.44f
         * smoothStep(0.20f, 0.72f, spectralFlux)
         + 0.24f * clamp01(context.onsetStrength);
@@ -2832,14 +3022,17 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
     rawBreathiness = clamp01(rawBreathiness);
 
     if (rawBreathiness > 0.34f && spectralFlux < 0.48f)
-        breathPersistenceFrames_ = std::min(24, breathPersistenceFrames_ + 1);
+        breathPersistenceMs_ += frameDurationMs;
     else
-        breathPersistenceFrames_ = std::max(0, breathPersistenceFrames_ - 2);
+        breathPersistenceMs_ -= 1.8f * frameDurationMs;
+    breathPersistenceMs_ = std::clamp(breathPersistenceMs_,
+                                      0.0f,
+                                      600.0f);
 
     const float persistence = smoothStep(
-        1.0f,
-        8.0f,
-        static_cast<float>(breathPersistenceFrames_));
+        profile_.breathPersistenceStartMs,
+        profile_.breathPersistenceFullMs,
+        breathPersistenceMs_);
     rawBreathiness *= 0.58f + 0.42f * persistence;
 
     const float frameLevel = totalEnergy > 0.0
@@ -2855,8 +3048,28 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
         * (rawBreathiness - smoothedBreathiness_);
     breathProtection_ = smoothStep(0.24f, 0.74f, smoothedBreathiness_);
 
+    const float offFamilyRatio = prominentPeakEnergy > 1.0e-14
+        ? clamp01(static_cast<float>(offFamilyPeakEnergy
+                                     / prominentPeakEnergy))
+        : 0.0f;
+    const float trackerDisagreement = 1.0f
+        - smoothStep(0.16f, 0.72f, context.consensus);
+    const float peakConflict = smoothStep(0.34f, 0.78f, offFamilyRatio);
+    const float polyphonyTarget = clamp01(
+        profile_.polyphonyTrust
+        * periodicEvidence
+        * (0.72f * peakConflict
+           + 0.28f * trackerDisagreement)
+        * (1.0f - 0.72f * transientEvidence));
+    const float polyphonyCoefficient = polyphonyTarget > smoothedPolyphony_
+        ? polyphonyAttackCoefficient_
+        : polyphonyReleaseCoefficient_;
+    smoothedPolyphony_ += polyphonyCoefficient
+        * (polyphonyTarget - smoothedPolyphony_);
+
     double finalHarmonicEnergy = 0.0;
     double finalNoiseEnergy = 0.0;
+    double weightedMaskMotion = 0.0;
     for (int bin = 0; bin <= positiveBins; ++bin)
     {
         const std::size_t index = static_cast<std::size_t>(bin);
@@ -2865,20 +3078,38 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
             2400.0f,
             7800.0f,
             frequencyHz);
+        const float maskReduction = profile_.breathMaskBodyReduction
+            + profile_.breathMaskAirReduction * highBandProtection;
         const float breathMaskScale = 1.0f
-            - breathProtection_ * (0.18f + 0.62f * highBandProtection);
+            - breathProtection_ * maskReduction;
         const float targetMask = clamp01(
             harmonicMaskScratch_[index]
-            * std::clamp(breathMaskScale, 0.20f, 1.0f));
-        const float coefficient = targetMask > harmonicMask_[index]
+            * std::clamp(breathMaskScale, 0.28f, 1.0f));
+
+        // Low-confidence frames must not redraw the complete mask.  Retain the
+        // previous spectral classification and allow only bounded, mode-aware
+        // movement per frame.  Falling mask values expose more residual, so
+        // they deliberately move more slowly in Live/Experimental.
+        const float analysisTrust = clamp01(
+            (0.18f + 0.82f * periodicEvidence)
+            * (1.0f - 0.70f * smoothedPolyphony_)
+            * (1.0f - 0.65f * transientEvidence));
+        const float inertialTarget = harmonicMask_[index]
+            + analysisTrust * (targetMask - harmonicMask_[index]);
+        const float coefficient = inertialTarget > harmonicMask_[index]
             ? maskAttackCoefficient_
             : maskReleaseCoefficient_;
-        harmonicMask_[index] += coefficient
-            * (targetMask - harmonicMask_[index]);
-        harmonicMask_[index] = clamp01(harmonicMask_[index]);
+        const float unconstrainedDelta = coefficient
+            * (inertialTarget - harmonicMask_[index]);
+        const float boundedDelta = std::clamp(
+            unconstrainedDelta,
+            -maskFallLimitPerFrame_,
+            maskRiseLimitPerFrame_);
+        harmonicMask_[index] = clamp01(harmonicMask_[index] + boundedDelta);
 
         const double energy = static_cast<double>(magnitudes_[index])
                             * magnitudes_[index];
+        weightedMaskMotion += energy * std::abs(static_cast<double>(boundedDelta));
         finalHarmonicEnergy += energy
             * static_cast<double>(harmonicMask_[index]);
         finalNoiseEnergy += energy
@@ -2892,37 +3123,82 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
     const float noisePathTarget = classifiedEnergy > 1.0e-14
         ? clamp01(static_cast<float>(finalNoiseEnergy / classifiedEnergy))
         : 1.0f;
+    const float maskMotion = classifiedEnergy > 1.0e-14
+        ? clamp01(static_cast<float>(weightedMaskMotion / classifiedEnergy) * 12.0f)
+        : 0.0f;
+    const float maskStabilityTarget = 1.0f - maskMotion;
+    const float maskStabilityCoefficient = maskStabilityTarget > smoothedMaskStability_
+        ? metricAttackCoefficient_
+        : metricReleaseCoefficient_;
+    smoothedMaskStability_ += maskStabilityCoefficient
+        * (maskStabilityTarget - smoothedMaskStability_);
 
-    // Wind Fix V5: attenuate only the sustained aperiodic residual.  The
-    // harmonic body remains fully corrected; consonant/transient evidence
-    // forces a quick restoration toward unity so articulation is preserved.
+    if (noisePathTarget >= profile_.noiseDominanceThreshold
+        && spectralFlux < 0.50f)
+    {
+        noiseDominanceMs_ += frameDurationMs;
+    }
+    else
+    {
+        noiseDominanceMs_ -= 1.6f * frameDurationMs;
+    }
+    noiseDominanceMs_ = std::clamp(noiseDominanceMs_, 0.0f, 700.0f);
+    const float noiseDominancePersistence = smoothStep(
+        profile_.noiseDominanceStartMs,
+        profile_.noiseDominanceFullMs,
+        noiseDominanceMs_);
+    const float noiseDominance = smoothStep(
+        profile_.noiseDominanceThreshold,
+        0.96f,
+        noisePathTarget) * noiseDominancePersistence;
+
+    // Long stable notes naturally contain more air.  Preserve a controlled
+    // residual floor instead of progressively de-breathing the singer.  This
+    // branch applies only when pitch evidence is strong and no competing
+    // harmonic family is present.
+    const bool sustainedMusicalState = context.trackingState == TrackingState::stable
+                                    || context.trackingState == TrackingState::transition;
+    const float longNoteAir = sustainedMusicalState
+        ? smoothStep(0.35f, 2.20f, context.noteAgeSeconds)
+            * periodicEvidence
+            * (1.0f - smoothedPolyphony_)
+        : 0.0f;
+
     const float reductionAmount = clamp01(context.breathReduction);
-    const float persistenceGate = smoothStep(2.0f, 9.0f,
-        static_cast<float>(breathPersistenceFrames_));
-    const float transientEvidence = clamp01(
-        0.68f * smoothStep(0.18f, 0.62f, spectralFlux)
-        + 0.32f * clamp01(context.onsetStrength));
     const float softNoiseEvidence = smoothStep(0.04f, 0.60f, noisePathTarget);
     const float breathEvidence = std::max(
-        breathProtection_ * persistenceGate,
+        breathProtection_ * persistence,
         0.80f * smoothStep(0.18f, 0.72f, smoothedBreathiness_));
-
-    // A gentle baseline acts on every confidently separated residual; the
-    // sustained-breath term increases attenuation on long airy tails.  The
-    // transient factor prevents the same rule from swallowing consonants.
-    const float reductionDrive = clamp01(
-        softNoiseEvidence * (0.40f + 0.60f * breathEvidence)
+    float reductionDrive = clamp01(
+        softNoiseEvidence * (0.38f + 0.62f * breathEvidence)
         * (1.0f - transientEvidence));
 
-    const float maximumReductionDb = 12.0f * reductionAmount;
+    // Noise-dominant safety mode (>~80%): attenuate a sustained breath bed,
+    // but never try to turn it into a pitched signal.  Polyphonic/bleed frames
+    // are preserved rather than mistaken for removable noise; their pitch
+    // correction authority is reduced through spectralReliability below.
+    const float dominanceDrive = noiseDominance
+        * (0.30f + 0.70f * breathEvidence)
+        * (1.0f - transientEvidence);
+    reductionDrive = std::max(reductionDrive, dominanceDrive);
+    reductionDrive *= 1.0f - 0.62f * smoothedPolyphony_;
+    reductionDrive *= 1.0f - 0.35f * longNoteAir;
+
+    const float maximumReductionDb = profile_.maximumNoiseReductionDb
+        * reductionAmount
+        * (1.0f - 0.45f * longNoteAir);
     const float targetReductionDb = maximumReductionDb * reductionDrive;
     float targetNoiseGain = std::pow(10.0f, -targetReductionDb / 20.0f);
 
-    // Never bury a transient or sibilant merely because it follows a breathy
-    // tail.  This branch changes only a frame-rate control value.
     const bool transientRestore = transientEvidence > 0.38f;
     if (transientRestore)
         targetNoiseGain = std::max(targetNoiseGain, 0.92f);
+
+    // If almost everything is classified as noise and periodic evidence is
+    // weak, do not gate the whole signal.  The controller will move toward the
+    // aligned dry path instead; retaining at least 82% prevents breath holes.
+    if (noiseDominance > 0.55f && periodicEvidence < 0.38f)
+        targetNoiseGain = std::max(targetNoiseGain, 0.82f);
 
     const float noiseGainCoefficient = targetNoiseGain < smoothedNoiseGain_
         ? noiseReductionAttackCoefficient_
@@ -2945,6 +3221,22 @@ void ModernPitchEngine::SpectralVoiceShifter::updateHarmonicNoiseAnalysis(
         : metricReleaseCoefficient_;
     smoothedNoisePathAmount_ += noiseCoefficient
         * (noisePathTarget - smoothedNoisePathAmount_);
+
+    const float familyReliability = periodicEvidence
+        * (0.30f + 0.70f * harmonicityTarget)
+        * (1.0f - 0.82f * smoothedPolyphony_);
+    const float dominanceReliability = 1.0f
+        - 0.64f * noiseDominance;
+    const float reliabilityTarget = clamp01(
+        (0.16f + 0.84f * familyReliability)
+        * (0.50f + 0.50f * smoothedMaskStability_)
+        * dominanceReliability);
+    const float reliabilityCoefficient = reliabilityTarget
+        > smoothedSpectralReliability_
+        ? reliabilityAttackCoefficient_
+        : reliabilityReleaseCoefficient_;
+    smoothedSpectralReliability_ += reliabilityCoefficient
+        * (reliabilityTarget - smoothedSpectralReliability_);
 }
 
 void ModernPitchEngine::SpectralVoiceShifter::synthesiseLayer(
@@ -3411,9 +3703,13 @@ float ModernPitchEngine::SpectralVoiceShifter::processBypassedSample(
     smoothedNoisePathAmount_ = 0.0f;
     smoothedNoiseGain_ = 1.0f;
     currentNoiseReductionDb_ = 0.0f;
+    smoothedPolyphony_ = 0.0f;
+    smoothedSpectralReliability_ = 1.0f;
+    smoothedMaskStability_ = 1.0f;
     dryBreathLowPass_ = 0.0f;
     breathProtection_ = 0.0f;
-    breathPersistenceFrames_ = 0;
+    breathPersistenceMs_ = 0.0f;
+    noiseDominanceMs_ = 0.0f;
     return delayedDry;
 }
 
@@ -3499,6 +3795,8 @@ void ModernPitchEngine::reset() noexcept
     correctionController_.reset();
     transitionManager_.reset();
     tempoController_.reset();
+    noteAgeTargetHz_ = 0.0f;
+    noteAgeSamples_ = 0;
 
     for (auto& shifter : shifters_)
         shifter.reset();
@@ -3514,6 +3812,10 @@ void ModernPitchEngine::reset() noexcept
     meterHarmonicity_.store(0.0f, std::memory_order_relaxed);
     meterNoisePath_.store(0.0f, std::memory_order_relaxed);
     meterNoiseReductionDb_.store(0.0f, std::memory_order_relaxed);
+    meterPolyphony_.store(0.0f, std::memory_order_relaxed);
+    meterSpectralReliability_.store(0.0f, std::memory_order_relaxed);
+    meterMaskStability_.store(1.0f, std::memory_order_relaxed);
+    meterSustainedNoteSeconds_.store(0.0f, std::memory_order_relaxed);
     meterConsensus_.store(0.0f, std::memory_order_relaxed);
     meterCorrectionCents_.store(0.0f, std::memory_order_relaxed);
     meterWetMix_.store(0.0f, std::memory_order_relaxed);
@@ -3600,6 +3902,9 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
     float latestHarmonicity = meterHarmonicity_.load(std::memory_order_relaxed);
     float latestNoisePath = meterNoisePath_.load(std::memory_order_relaxed);
     float latestNoiseReductionDb = meterNoiseReductionDb_.load(std::memory_order_relaxed);
+    float latestPolyphony = meterPolyphony_.load(std::memory_order_relaxed);
+    float latestSpectralReliability = meterSpectralReliability_.load(std::memory_order_relaxed);
+    float latestMaskStability = meterMaskStability_.load(std::memory_order_relaxed);
     float latestConsensus = meterConsensus_.load(std::memory_order_relaxed);
     float latestOnsetStrength = 0.0f;
     int latestDetectorSupport = meterDetectorSupport_.load(std::memory_order_relaxed);
@@ -3628,24 +3933,33 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
         {
             float spectralBreath = shifters_[0].getBreathiness();
             float spectralHarmonicity = shifters_[0].getHarmonicity();
+            float spectralPolyphony = shifters_[0].getPolyphony();
+            float spectralReliability = shifters_[0].getSpectralReliability();
             if (!useMidSide && numberOfChannels > 1)
             {
                 spectralBreath = 0.0f;
                 spectralHarmonicity = 0.0f;
+                spectralPolyphony = 0.0f;
+                spectralReliability = 0.0f;
                 for (int channel = 0; channel < numberOfChannels; ++channel)
                 {
-                    spectralBreath += shifters_[static_cast<std::size_t>(channel)]
-                        .getBreathiness();
-                    spectralHarmonicity += shifters_[static_cast<std::size_t>(channel)]
-                        .getHarmonicity();
+                    const auto& shifter = shifters_[static_cast<std::size_t>(channel)];
+                    spectralBreath += shifter.getBreathiness();
+                    spectralHarmonicity += shifter.getHarmonicity();
+                    spectralPolyphony += shifter.getPolyphony();
+                    spectralReliability += shifter.getSpectralReliability();
                 }
                 const float inverseChannels = 1.0f
                     / static_cast<float>(numberOfChannels);
                 spectralBreath *= inverseChannels;
                 spectralHarmonicity *= inverseChannels;
+                spectralPolyphony *= inverseChannels;
+                spectralReliability *= inverseChannels;
             }
             correctionController_.setSpectralReliability(spectralBreath,
-                                                         spectralHarmonicity);
+                                                         spectralHarmonicity,
+                                                         spectralPolyphony,
+                                                         spectralReliability);
             correctionController_.acceptObservation(observation,
                                                     scaleQuantizer_,
                                                     parameters);
@@ -3668,6 +3982,38 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
         const auto trackingState = correctionController_.getState();
         const bool musicalState = trackingState != TrackingState::unvoiced
                                && trackingState != TrackingState::release;
+        const float currentTargetPitchHz =
+            correctionController_.getTargetPitchHz();
+        if (musicalState && currentTargetPitchHz > 0.0f)
+        {
+            bool restartSustainClock = noteAgeTargetHz_ <= 0.0f;
+            if (!restartSustainClock)
+            {
+                const float targetJumpCents = static_cast<float>(
+                    1200.0 * std::abs(std::log2(
+                        std::max(1.0e-6f, currentTargetPitchHz)
+                        / std::max(1.0e-6f, noteAgeTargetHz_))));
+                restartSustainClock = targetJumpCents > 70.0f
+                    || latestOnsetStrength > 0.62f;
+            }
+
+            if (restartSustainClock)
+            {
+                noteAgeSamples_ = 0;
+                noteAgeTargetHz_ = currentTargetPitchHz;
+            }
+            else
+            {
+                ++noteAgeSamples_;
+            }
+        }
+        else
+        {
+            noteAgeSamples_ = 0;
+            noteAgeTargetHz_ = 0.0f;
+        }
+        const float noteAgeSeconds = static_cast<float>(
+            std::min(12.0, static_cast<double>(noteAgeSamples_) / sampleRate_));
         const auto tempoDecision = tempoController_.processSample(
             correctionController_.getCurrentCorrectionCents(),
             correctionController_.getDesiredCorrectionCents(),
@@ -3693,7 +4039,9 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
             latestVoicing,
             latestConsensus,
             latestOnsetStrength,
-            clamp01(parameters.breathReduction)
+            clamp01(parameters.breathReduction),
+            trackingState,
+            noteAgeSeconds
         };
 
         if (useMidSide)
@@ -3737,6 +4085,9 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
     latestHarmonicity = 0.0f;
     latestNoisePath = 0.0f;
     latestNoiseReductionDb = 0.0f;
+    latestPolyphony = 0.0f;
+    latestSpectralReliability = 0.0f;
+    latestMaskStability = 0.0f;
     const int meteredShifters = useMidSide ? 1 : numberOfChannels;
     for (int channel = 0; channel < meteredShifters; ++channel)
     {
@@ -3745,6 +4096,9 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
         latestHarmonicity += shifter.getHarmonicity();
         latestNoisePath += shifter.getNoisePathAmount();
         latestNoiseReductionDb += shifter.getNoiseReductionDb();
+        latestPolyphony += shifter.getPolyphony();
+        latestSpectralReliability += shifter.getSpectralReliability();
+        latestMaskStability += shifter.getMaskStability();
     }
     const float inverseMeteredShifters = 1.0f
         / static_cast<float>(std::max(1, meteredShifters));
@@ -3752,6 +4106,11 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
     latestHarmonicity *= inverseMeteredShifters;
     latestNoisePath *= inverseMeteredShifters;
     latestNoiseReductionDb *= inverseMeteredShifters;
+    latestPolyphony *= inverseMeteredShifters;
+    latestSpectralReliability *= inverseMeteredShifters;
+    latestMaskStability *= inverseMeteredShifters;
+    const float latestSustainedNoteSeconds = static_cast<float>(
+        std::min(12.0, static_cast<double>(noteAgeSamples_) / sampleRate_));
     const auto tempoMeter = tempoController_.getMetering();
 
     meterSequence_.fetch_add(1u, std::memory_order_acq_rel); // odd: publishing
@@ -3764,6 +4123,11 @@ void ModernPitchEngine::process(juce::AudioBuffer<float>& buffer,
     meterHarmonicity_.store(latestHarmonicity, std::memory_order_relaxed);
     meterNoisePath_.store(latestNoisePath, std::memory_order_relaxed);
     meterNoiseReductionDb_.store(latestNoiseReductionDb, std::memory_order_relaxed);
+    meterPolyphony_.store(latestPolyphony, std::memory_order_relaxed);
+    meterSpectralReliability_.store(latestSpectralReliability, std::memory_order_relaxed);
+    meterMaskStability_.store(latestMaskStability, std::memory_order_relaxed);
+    meterSustainedNoteSeconds_.store(latestSustainedNoteSeconds,
+                                     std::memory_order_relaxed);
     meterConsensus_.store(latestConsensus, std::memory_order_relaxed);
     meterCorrectionCents_.store(correctionController_.getCorrectionCents(),
                                 std::memory_order_relaxed);
@@ -3835,6 +4199,8 @@ void ModernPitchEngine::processBypassed(juce::AudioBuffer<float>& buffer)
     correctionController_.reset();
     transitionManager_.reset();
     tempoController_.reset();
+    noteAgeTargetHz_ = 0.0f;
+    noteAgeSamples_ = 0;
 
     const bool useMidSide = currentStereoMode_ == StereoMode::linkedMidSide
                          && numberOfChannels >= 2;
@@ -3879,6 +4245,10 @@ void ModernPitchEngine::processBypassed(juce::AudioBuffer<float>& buffer)
     meterHarmonicity_.store(0.0f, std::memory_order_relaxed);
     meterNoisePath_.store(0.0f, std::memory_order_relaxed);
     meterNoiseReductionDb_.store(0.0f, std::memory_order_relaxed);
+    meterPolyphony_.store(0.0f, std::memory_order_relaxed);
+    meterSpectralReliability_.store(0.0f, std::memory_order_relaxed);
+    meterMaskStability_.store(1.0f, std::memory_order_relaxed);
+    meterSustainedNoteSeconds_.store(0.0f, std::memory_order_relaxed);
     meterConsensus_.store(0.0f, std::memory_order_relaxed);
     meterCorrectionCents_.store(0.0f, std::memory_order_relaxed);
     meterWetMix_.store(0.0f, std::memory_order_relaxed);
@@ -3921,6 +4291,12 @@ ModernPitchEngine::Metering ModernPitchEngine::getMetering() const noexcept
         result.harmonicity = meterHarmonicity_.load(std::memory_order_relaxed);
         result.noisePath = meterNoisePath_.load(std::memory_order_relaxed);
         result.noiseReductionDb = meterNoiseReductionDb_.load(std::memory_order_relaxed);
+        result.polyphony = meterPolyphony_.load(std::memory_order_relaxed);
+        result.spectralReliability = meterSpectralReliability_.load(
+            std::memory_order_relaxed);
+        result.maskStability = meterMaskStability_.load(std::memory_order_relaxed);
+        result.sustainedNoteSeconds = meterSustainedNoteSeconds_.load(
+            std::memory_order_relaxed);
         result.consensus = meterConsensus_.load(std::memory_order_relaxed);
         result.correctionCents = meterCorrectionCents_.load(std::memory_order_relaxed);
         result.wetMix = meterWetMix_.load(std::memory_order_relaxed);

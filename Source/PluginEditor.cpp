@@ -69,7 +69,7 @@ MicrotonalAutotuneAudioProcessorEditor::MicrotonalAutotuneAudioProcessorEditor (
     addAndMakeVisible (modeSelectorLabel);
 
     modeSelector.setJustificationType (juce::Justification::centredLeft);
-    modeSelector.addItem ("Slow",         1);
+    modeSelector.addItem ("High Latency", 1);
     modeSelector.addItem ("Quality",      2);
     modeSelector.addItem ("Live",         3);
     modeSelector.addItem ("Experimental", 4);
@@ -531,6 +531,17 @@ void MicrotonalAutotuneAudioProcessorEditor::drawMeterPanel (
         status += "   Breath GR: "
                + juce::String (displayedMetering.noiseReductionDb, 1)
                + " dB";
+    status += "   Poly: "
+           + juce::String (displayedMetering.polyphony * 100.0f, 0)
+           + "%   Rel: "
+           + juce::String (displayedMetering.spectralReliability * 100.0f, 0)
+           + "%   Mask: "
+           + juce::String (displayedMetering.maskStability * 100.0f, 0)
+           + "%";
+    if (displayedMetering.sustainedNoteSeconds > 0.05f)
+        status += "   Hold: "
+               + juce::String (displayedMetering.sustainedNoteSeconds, 1)
+               + " s";
     g.drawText (status, statusRow, juce::Justification::centredLeft);
 
     const auto drawBar = [&g](juce::Rectangle<int> area,
