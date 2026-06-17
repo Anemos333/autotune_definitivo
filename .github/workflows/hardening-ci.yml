@@ -1,0 +1,78 @@
+name: Hardening CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sanitizers: 'ON'
+            label: linux-sanitized
+          - os: windows-latest
+            sanitizers: 'OFF'
+            label: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply and verify deterministic source patch
+        run: python Tools/apply_hardening.py
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DBUILD_TESTING=ON
+          -DAUTOTUNE_BUILD_TESTS=ON
+          -DAUTOTUNE_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
+          -DAUTOTUNE_ENABLE_LONG_TESTS=OFF
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo --parallel 2
+      - name: Test
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts/vst3 artifacts/logs
+          find build -type d -name '*.vst3' -exec cp -R {} artifacts/vst3/ \; || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hardening-${{ matrix.label }}
+          path: artifacts
+          if-no-files-found: warn
+
+  long-stress:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 Tools/apply_hardening.py
+      - run: >-
+          cmake -S . -B build-long -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DAUTOTUNE_BUILD_TESTS=ON
+          -DAUTOTUNE_ENABLE_LONG_TESTS=ON
+          -DAUTOTUNE_ENABLE_SANITIZERS=ON
+      - run: cmake --build build-long --target AutotuneProcessorStress --parallel 2
+      - name: Full 100k/10k stress profile
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build-long/AutotuneProcessorStress_artefacts/Release/AutotuneProcessorStress --long \
+            2>&1 | tee long-stress.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: long-stress-log
+          path: long-stress.log
+          if-no-files-found: warn
