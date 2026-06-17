@@ -24,6 +24,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install Linux JUCE dependencies
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libfreetype6-dev libfontconfig1-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libcurl4-openssl-dev
       - name: Make patch matching whitespace-tolerant
         shell: bash
         run: |
@@ -64,12 +74,13 @@ jobs:
           cat hardening_patch.log
           echo "$code" > hardening_patch_exit.txt
           exit $code
-      - name: Finalize portable CMake patch
+      - name: Finalize generated source
         if: success()
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
+
           cmake = Path('CMakeLists.txt')
           text = cmake.read_text(encoding='utf-8')
           marker = '# Plugin target — VST3 only\n'
@@ -79,13 +90,45 @@ jobs:
           text = text.replace('    FORMATS VST3 $<$<PLATFORM_ID:Darwin>:AU>', '    FORMATS ${AUTOTUNE_PLUGIN_FORMATS}')
           cmake.write_text(text, encoding='utf-8', newline='\n')
 
-          script = Path('Tools/apply_hardening.py')
-          source = script.read_text(encoding='utf-8')
-          bad = "cm=repl(cm,'    FORMATS VST3 AU','    FORMATS VST3 $<$<PLATFORM_ID:Darwin>:AU>','portable formats')"
-          good = """if 'set(AUTOTUNE_PLUGIN_FORMATS VST3)' not in cm:\n    cm=repl(cm, '# Plugin target — VST3 only', 'set(AUTOTUNE_PLUGIN_FORMATS VST3)\\nif(APPLE)\\n    list(APPEND AUTOTUNE_PLUGIN_FORMATS AU)\\nendif()\\n\\n# Plugin target — VST3 only', 'portable format list')\ncm=repl(cm,'    FORMATS VST3 AU','    FORMATS ${AUTOTUNE_PLUGIN_FORMATS}','portable formats')"""
-          if bad in source:
-              source = source.replace(bad, good, 1)
-          script.write_text(source, encoding='utf-8', newline='\n')
+          processor = Path('Source/PluginProcessor.cpp')
+          source = processor.read_text(encoding='utf-8')
+          old = '''double MicrotonalAutotuneAudioProcessor::findNearestTarget (double detectedFreqHz) const
+          {
+              if (detectedFreqHz <= 0.0)
+                  return detectedFreqHz;
+
+              auto scaleRatios = getCurrentScaleRatios();
+              if (scaleRatios.empty())
+                  return detectedFreqHz;
+
+              // Reference: use selected root note frequency
+              // Work in log2 space relative to the root.
+              double refFreq = getRootFrequency();
+              double logRatio = std::log2 (detectedFreqHz / refFreq);'''
+          new = '''double MicrotonalAutotuneAudioProcessor::findNearestTarget (double detectedFreqHz) const
+          {
+              if (detectedFreqHz <= 0.0)
+                  return detectedFreqHz;
+
+              const ScaleSnapshot scale = readScaleSnapshot();
+              if (scale.count <= 0)
+                  return detectedFreqHz;
+
+              // Reference: use the same immutable snapshot as the modern engine.
+              const double refFreq = scale.rootFrequency;
+              double logRatio = std::log2 (detectedFreqHz / refFreq);'''
+          old_loop = '''    for (double ratio : scaleRatios)
+              {
+                  double logPos = std::log2 (ratio); // [0, ~1)'''
+          new_loop = '''    for (int scaleIndex = 0; scaleIndex < scale.count; ++scaleIndex)
+              {
+                  const double ratio = scale.ratios[static_cast<std::size_t>(scaleIndex)];
+                  double logPos = std::log2 (ratio); // [0, ~1)'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          if old_loop in source:
+              source = source.replace(old_loop, new_loop, 1)
+          processor.write_text(source, encoding='utf-8', newline='\n')
           PY
       - name: Package modified source overlay
         if: success()
@@ -114,7 +157,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=OFF -DJUCE_BUILD_EXAMPLES=OFF 2>&1 | tee configure.log
+          extra=""
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            extra="-DAUTOTUNE_ENABLE_SANITIZERS=ON"
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=OFF -DJUCE_BUILD_EXAMPLES=OFF $extra 2>&1 | tee configure.log
       - name: Build tests and plugin
         if: success()
         shell: bash
@@ -124,6 +171,9 @@ jobs:
       - name: Run tests
         if: success()
         shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           set -o pipefail
           ctest --test-dir build -C Release --output-on-failure 2>&1 | tee ctest.log
