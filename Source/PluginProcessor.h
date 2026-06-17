@@ -128,10 +128,12 @@ private:
     std::array<LivePitchProcessor, 3> livePitchProcessors;
     std::atomic<int> activeLiveProcessorIndex { 1 };
 
-    // Single-writer seqlock. The publisher runs off the callback; the callback
-    // copies a coherent fixed-size snapshot and never touches mutable vectors.
-    std::atomic<std::uint32_t> scaleSnapshotSequence { 0 };
-    ScaleSnapshot publishedScaleSnapshot;
+    // Race-free triple buffering. The message thread writes only a slot that is
+    // neither published nor currently copied by the callback, then atomically
+    // publishes that immutable slot.
+    std::array<ScaleSnapshot, 3> scaleSnapshots;
+    std::atomic<int> publishedScaleSlot { 0 };
+    std::atomic<int> audioReadingScaleSlot { -1 };
     ScaleSnapshot audioScaleSnapshot;
     std::atomic<std::uint64_t> scaleSnapshotRevision { 0 };
 
