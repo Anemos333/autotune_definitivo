@@ -4,8 +4,11 @@
 #include "ScaleDefinitions.h"
 #include "CustomScalePresets.h"
 #include "LivePitchProcessor.h"
-#include <vector>
+
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <vector>
 
 class MicrotonalAutotuneAudioProcessor : public juce::AudioProcessor
 {
@@ -37,61 +40,83 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
-    // Access to APVTS
-    juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
+    juce::AudioProcessorValueTreeState& getAPVTS() noexcept { return apvts; }
+    CustomScalePresets& getCustomPresets() noexcept { return customPresets; }
 
-    // Custom presets access (thread-safe via message thread only for GUI)
-    CustomScalePresets& getCustomPresets() { return customPresets; }
+    // Message-thread helpers. They publish one coherent, fixed-size snapshot to
+    // the callback instead of exposing mutable vectors to the DSP.
+    void selectBuiltInScale (int index) noexcept;
+    void selectCustomPreset (int index) noexcept;
+    void selectRootNote (int index) noexcept;
+    void publishScaleSnapshot() noexcept;
 
-    // Get current active scale ratios
+    // Non-realtime convenience API retained for UI/state tooling.
     std::vector<double> getCurrentScaleRatios() const;
 
-    // Scale index parameter
     std::atomic<int> currentScaleIndex { 0 };
-
-    // For custom scale: store which custom preset is active (-1 = none, using built-in)
     std::atomic<int> activeCustomPresetIndex { -1 };
-
-    // Root note index: 0-11 = C,C#,D,...,B (12-ET), 12-18 = Ni,Pa,Vu,Ga,Di,Ke,Zo (Byzantine)
-    std::atomic<int> rootNoteIndex { 9 }; // default A
-
-    // Processing mode: 0=Slow, 1=Quality, 2=Live, 3=Experimental
+    std::atomic<int> rootNoteIndex { 9 };
     std::atomic<int> processingMode { 0 };
 
-    // Update processing mode — must be called from message thread
+    // Must be called outside the audio callback. All engines are prepared in
+    // prepareToPlay; mode changes only reset and atomically publish a ready slot.
     void updateProcessingMode (int newMode);
 
-    // Get the reference frequency for the selected root note
-    double getRootFrequency() const;
-
-    // Lock-free coherent snapshot for the editor/debug overlay.
+    double getRootFrequency() const noexcept;
     [[nodiscard]] LivePitchProcessor::Metering getPitchMetering() const noexcept;
 
 private:
+    static constexpr int maximumScaleRatios = ModernPitchEngine::maxScaleRatios;
+    static constexpr int maximumSlowChannels = 2;
+    static constexpr int minimumPreparedBlockSize = 4096;
+
+    struct ScaleSnapshot
+    {
+        std::array<double, maximumScaleRatios> ratios {};
+        int count = 0;
+        double rootFrequency = 440.0;
+        std::uint64_t revision = 0;
+    };
+
+    struct SlowChannelState
+    {
+        std::vector<float> circularBuffer;
+        int writePosition = 0;
+        double readPosition = 0.0;
+    };
+
     juce::AudioProcessorValueTreeState apvts;
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-
     CustomScalePresets customPresets;
 
-    // YIN pitch detection (Slow mode)
-    float detectPitchYIN (const float* buffer, int numSamples, double sampleRate) const;
+    float detectPitchYIN (const float* buffer, int numSamples, double sampleRate) noexcept;
+    double findNearestTarget (double detectedFreqHz,
+                              const ScaleSnapshot& scale) const noexcept;
 
-    // Find nearest note in scale (Slow mode)
-    double findNearestTarget (double detectedFreqHz) const;
+    [[nodiscard]] ScaleSnapshot readScaleSnapshot() noexcept;
+    void resetSlowStateNoAllocation() noexcept;
+    bool sanitiseInputBuffer (juce::AudioBuffer<float>& buffer) noexcept;
+    bool sanitiseOutputBuffer (juce::AudioBuffer<float>& buffer) noexcept;
+    void recoverActiveDSPState (int mode) noexcept;
 
-    // Pitch shifting state (Slow mode)
+    [[nodiscard]] LivePitchProcessor& liveProcessorForMode (int mode) noexcept;
+    [[nodiscard]] const LivePitchProcessor& liveProcessorForMode (int mode) const noexcept;
+    [[nodiscard]] static int liveIndexForMode (int mode) noexcept;
+    static ModernPitchEngine::LatencyMode modeToLatency (int mode) noexcept;
+    int getLatencyForMode (int mode) const noexcept;
+
+    [[nodiscard]] CreativeTempo::Settings getTempoSettings() const noexcept;
+    [[nodiscard]] CreativeTempo::HostPosition readHostTempoPosition (
+        int numberOfSamples) const noexcept;
+
     double currentSampleRate = 44100.0;
+    int lastSamplesPerBlock = 512;
+    std::atomic<bool> prepared { false };
 
-    // Smoothed pitch shift ratio (Slow mode)
     double smoothedShiftRatio = 1.0;
-
-    // Circular buffer for pitch shifting (Slow mode)
-    std::vector<float> circularBuffer;
     int circBufSize = 0;
-    int circBufWritePos = 0;
-    double circBufReadPos = 0.0;
+    std::array<SlowChannelState, maximumSlowChannels> slowChannels;
 
-    // YIN internal buffer (Slow mode)
     std::vector<float> yinBuffer;
     std::vector<float> yinAccumulator;
     int yinBufferPos = 0;
@@ -100,21 +125,17 @@ private:
     std::atomic<float> slowMeterPitchHz { 0.0f };
     std::atomic<float> slowMeterTargetHz { 0.0f };
 
-    // ModernPitchEngine-based live pitch processor (Quality/Live/Experimental modes)
-    LivePitchProcessor livePitchProcessor;
+    std::array<LivePitchProcessor, 3> livePitchProcessors;
+    std::atomic<int> activeLiveProcessorIndex { 1 };
 
-    // Cached block size for mode changes
-    int lastSamplesPerBlock = 512;
-
-    // Convert processingMode int to LatencyMode enum
-    static ModernPitchEngine::LatencyMode modeToLatency (int mode) noexcept;
-
-    // Get the latency in samples for the current mode
-    int getLatencyForMode (int mode) const;
-
-    [[nodiscard]] CreativeTempo::Settings getTempoSettings() const noexcept;
-    [[nodiscard]] CreativeTempo::HostPosition readHostTempoPosition(
-        int numberOfSamples) const noexcept;
+    // Race-free triple buffering. The message thread writes only a slot that is
+    // neither published nor currently copied by the callback, then atomically
+    // publishes that immutable slot.
+    std::array<ScaleSnapshot, 3> scaleSnapshots;
+    std::atomic<int> publishedScaleSlot { 0 };
+    std::atomic<int> audioReadingScaleSlot { -1 };
+    ScaleSnapshot audioScaleSnapshot;
+    std::atomic<std::uint64_t> scaleSnapshotRevision { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MicrotonalAutotuneAudioProcessor)
 };
