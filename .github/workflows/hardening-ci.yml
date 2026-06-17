@@ -1,0 +1,55 @@
+name: Hardening CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  apply-and-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply checked hardening patch
+        run: python Tools/apply_hardening.py
+      - name: Commit generated source patch
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Source CMakeLists.txt Docs
+            git commit -m "Apply phase and real-time hardening"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=OFF -DJUCE_BUILD_EXAMPLES=OFF
+      - name: Build tests and plugin
+        run: cmake --build build --config Release --parallel 2
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload VST3 and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            build/**/*VST3*/**
+            build/**/*.vst3/**
+            build/Testing/**
