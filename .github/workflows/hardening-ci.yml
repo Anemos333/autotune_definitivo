@@ -24,6 +24,37 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Make patch matching whitespace-tolerant
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('Tools/apply_hardening.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''def repl(text, old, new, label):
+              n=text.count(old)
+              if n == 0 and new in text:
+                  return text
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected exactly one match, found {n}')
+              return text.replace(old,new,1)'''
+          new = '''def repl(text, old, new, label):
+              n=text.count(old)
+              if n == 1:
+                  return text.replace(old,new,1)
+              if n == 0 and new in text:
+                  return text
+              parts = re.split(r'([ \\t]+)', old)
+              pattern = ''.join(r'[ \\t]+' if part and part[0] in ' \\t' else re.escape(part) for part in parts)
+              matches = list(re.finditer(pattern, text))
+              if len(matches) != 1:
+                  raise RuntimeError(f'{label}: exact={n}, whitespace_matches={len(matches)}')
+              match = matches[0]
+              return text[:match.start()] + new + text[match.end():]'''
+          if old not in s:
+              raise SystemExit('repl helper context not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
       - name: Apply checked hardening patch
         shell: bash
         run: |
