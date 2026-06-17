@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 jobs:
@@ -25,31 +25,55 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply checked hardening patch
-        run: python Tools/apply_hardening.py
-      - name: Commit generated source patch
-        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Source CMakeLists.txt Docs
-            git commit -m "Apply phase and real-time hardening"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
+          set +e
+          python Tools/apply_hardening.py > hardening_patch.log 2>&1
+          code=$?
+          cat hardening_patch.log
+          echo "$code" > hardening_patch_exit.txt
+          exit $code
+      - name: Package modified source overlay
+        if: success()
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil, subprocess
+          root = Path.cwd()
+          names = subprocess.check_output(['git','diff','--name-only'], text=True).splitlines()
+          overlay = root / 'hardening_source_overlay'
+          for name in names:
+              src = root / name
+              if src.is_file():
+                  dst = overlay / name
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+          (overlay / 'BASE_COMMIT.txt').write_text(subprocess.check_output(['git','rev-parse','origin/main'], text=True), encoding='utf-8')
+          (overlay / 'CHANGED_FILES.txt').write_text('\n'.join(names) + '\n', encoding='utf-8')
+          subprocess.run(['git','diff','--binary','--output=hardening.patch'], check=True)
+          shutil.make_archive('hardening_source_overlay', 'zip', overlay)
+          PY
       - name: Configure
+        if: success()
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=OFF -DJUCE_BUILD_EXAMPLES=OFF
       - name: Build tests and plugin
+        if: success()
         run: cmake --build build --config Release --parallel 2
       - name: Run tests
+        if: success()
         run: ctest --test-dir build -C Release --output-on-failure
-      - name: Upload VST3 and logs
+      - name: Upload source, VST3 and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hardening-${{ matrix.os }}
           if-no-files-found: ignore
           path: |
+            hardening_patch.log
+            hardening_patch_exit.txt
+            hardening.patch
+            hardening_source_overlay.zip
             build/**/*VST3*/**
             build/**/*.vst3/**
             build/Testing/**
